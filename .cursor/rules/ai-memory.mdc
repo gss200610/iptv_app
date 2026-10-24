@@ -1,0 +1,53 @@
+---
+description: "Continuidade de desenvolvimento com AI Memory MCP e economia de tokens com RTK"
+alwaysApply: true
+---
+
+# AI Memory + RTK — Regras permanentes do projeto
+
+## Objetivo
+Preservar o contexto correto deste repositório entre sessões do Cursor e, quando a mesma base de memória estiver acessível, entre computadores. Usar RTK para reduzir a saída de comandos compatíveis, sem comprometer diagnósticos.
+
+## No início de cada sessão ou tarefa
+1. Identifique o projeto pela raiz do workspace, nome do repositório e, quando disponível, URL remota do Git. Não confunda memórias de projetos diferentes.
+2. Verifique a disponibilidade das ferramentas MCP do AI Memory; utilize as ferramentas efetivamente expostas nesta instalação, sem presumir nomes ou capacidades.
+3. Consulte a memória correspondente a este repositório: último handoff, decisões arquiteturais, funcionalidades concluídas, erros conhecidos e próximos passos.
+4. Se nenhuma memória for encontrada, informe isso brevemente e utilize o estado atual do repositório como fonte inicial. Não invente histórico.
+5. Compare informações recuperadas com o código atual, Git e testes; se houver divergência, priorize o estado verificável do projeto e sinalize a diferença.
+6. Antes de mudanças relevantes, apresente um resumo conciso do ponto de retomada e do plano de trabalho.
+
+## Durante o desenvolvimento
+1. Consulte o AI Memory quando o contexto anterior puder influenciar decisões, especialmente em refatorações, alterações de arquitetura, banco de dados, contratos de API e correções recorrentes.
+2. Registre decisões técnicas relevantes, seu motivo e consequências, soluções confirmadas, padrões específicos do projeto e pendências. Não registre cada comando trivial.
+3. Atualize ou marque como superadas as informações desatualizadas, evitando memórias contraditórias.
+4. Associe os registros ao projeto/repositório atual usando os recursos de identificação e escopo oferecidos pelo AI Memory.
+5. Nunca grave segredos, tokens de acesso, credenciais, dados pessoais ou conteúdo sensível na memória. Respeite políticas de captura e exclusão.
+6. Use RTK para comandos compatíveis de Git, busca, Maven/Gradle e testes quando disponível. Se o RTK omitir informação necessária para diagnosticar erro, execute o comando original e preserve a saída relevante.
+7. Não execute `git commit`, `git push`, alterações destrutivas, migrações de banco ou modificações fora do escopo sem solicitação/autorização explícita.
+8. Não altere as configurações globais de RTK, hooks, MCP ou AI Memory sem necessidade demonstrada e autorização.
+
+## Ao concluir cada tarefa significativa
+1. Resuma o que foi efetivamente concluído, o que não foi concluído e quaisquer limitações.
+2. Registre ou atualize no AI Memory, quando as ferramentas permitirem:
+   - objetivo da tarefa e resultado;
+   - decisões técnicas tomadas e justificativas;
+   - arquivos ou módulos relevantes alterados;
+   - comandos de teste executados e resultados reais;
+   - falhas, bloqueios e riscos conhecidos;
+   - próximos passos claros e ordenados;
+   - branch e referência do commit atual, se úteis para retomar o trabalho.
+3. Crie ou atualize um handoff de continuidade com o estado VERIFICADO do projeto e a próxima ação recomendada. Não afirme que salvou algo sem confirmação da ferramenta.
+4. Se a memória não puder ser gravada, explique o impedimento e apresente o resumo de continuidade no chat para que possa ser salvo depois.
+5. Informe de modo breve se a memória foi atualizada e se os testes passaram ou falharam.
+
+## Ao retomar em outro computador
+1. Recupere a memória e o handoff mais recentes do MESMO repositório.
+2. Confirme que o código local está na branch/commit esperados; não presuma que a sincronização da memória sincroniza os arquivos do projeto.
+3. Se o código divergir do handoff, descreva as diferenças antes de continuar.
+4. Não substitua memórias de outra máquina automaticamente sem verificar a origem e a atualidade dos registros.
+
+## Limites importantes
+- A presença desta regra não inicia o servidor AI Memory, não instala o MCP e não sincroniza bancos de memória entre PCs.
+- Captura automática por hooks não garante criação de páginas de memória ou handoff; verifique o sucesso das operações disponíveis.
+- RTK reduz tokens nas saídas dos comandos que processa, não necessariamente no consumo total do Cursor.
+- Nunca invente resultados de comandos, testes ou conteúdos recuperados de memória.

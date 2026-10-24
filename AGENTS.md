@@ -1,5 +1,15 @@
 This is an Expo/React Native mobile application. Prioritize mobile-first patterns, performance, and cross-platform compatibility.
 
+## Project memory — read first
+
+Before changing anything, read `docs/ai-memory/HANDOFF.md` (where the last session stopped) and `docs/ai-memory/PROJECT_STATE.md` (architecture decisions, features, known issues, build). Update both at the end of each session. Never store the user's IPTV server URL, username or password in them.
+
+Project specifics that override the generic guidance below:
+
+- Targets Android phone + Android TV in one APK, using `react-native-tvos` (aliased as `react-native`) and `@react-native-tvos/config-tv`. Always prebuild with `EXPO_TV=1`.
+- Navigation uses **React Navigation native-stack** (`src/navigation/`), not Expo Router.
+- APKs are built locally with Gradle (`android\gradlew.bat assembleRelease`), not EAS.
+
 ## Expo has changed — do not trust your training data
 
 Expo ships breaking changes every SDK release. APIs you remember are likely renamed, moved, or removed. Before writing any code that touches an Expo, EAS, or React Native API:
@@ -25,7 +35,7 @@ Run lint and typecheck before declaring any task done.
 
 ## Navigation & Routing
 
-- Use **Expo Router** for all navigation. Routes live in `src/app/` — every file there is a screen, `_layout.tsx` files define navigators. Keep non-route code (components, hooks, utils) outside `src/app/`.
+- (Generic template — this project uses React Navigation; see "Project memory" above.) Use **Expo Router** for all navigation. Routes live in `src/app/` — every file there is a screen, `_layout.tsx` files define navigators. Keep non-route code (components, hooks, utils) outside `src/app/`.
 - Import `Link`, `router`, and `useLocalSearchParams` from `expo-router`.
 - Docs: https://docs.expo.dev/router/introduction.md
 
