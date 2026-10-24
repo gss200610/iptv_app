@@ -1,0 +1,582 @@
+diff --git a/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/DataSourceUtils.kt b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/DataSourceUtils.kt
+index 460fb7b..521ec27 100644
+--- a/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/DataSourceUtils.kt
++++ b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/DataSourceUtils.kt
+@@ -26,7 +26,8 @@ fun buildBaseDataSourceFactory(context: Context, videoSource: VideoSource): Data
+ 
+ @OptIn(UnstableApi::class)
+ fun buildOkHttpDataSourceFactory(context: Context, videoSource: VideoSource): OkHttpDataSource.Factory {
+-  val client = OkHttpClient.Builder().build()
++  val baseClient = OkHttpClient.Builder().build()
++  val client = baseClient.newBuilder().addInterceptor(ResumingInterceptor(baseClient)).build()
+ 
+   // If the application name has ANY non-ASCII characters, we need to strip them out. This is because using non-ASCII characters
+   // in the User-Agent header can cause issues with getting the media to play.
+@@ -53,8 +54,9 @@ fun buildCacheDataSourceFactory(context: Context, videoSource: VideoSource): Dat
+   }
+ }
+ 
++@OptIn(UnstableApi::class)
+ fun buildMediaSourceFactory(context: Context, dataSourceFactory: DataSource.Factory): MediaSource.Factory {
+-  return DefaultMediaSourceFactory(context).setDataSourceFactory(dataSourceFactory)
++  return DefaultMediaSourceFactory(context, IndexlessSeekExtractorsFactory()).setDataSourceFactory(dataSourceFactory)
+ }
+ 
+ @OptIn(UnstableApi::class)
+diff --git a/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/IndexlessSeekExtractor.kt b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/IndexlessSeekExtractor.kt
+new file mode 100644
+index 0000000..fffa718
+--- /dev/null
++++ b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/IndexlessSeekExtractor.kt
+@@ -0,0 +1,420 @@
++package expo.modules.video
++
++import android.net.Uri
++import androidx.annotation.OptIn
++import androidx.media3.common.C
++import androidx.media3.common.util.UnstableApi
++import androidx.media3.extractor.DefaultExtractorsFactory
++import androidx.media3.extractor.Extractor
++import androidx.media3.extractor.ExtractorInput
++import androidx.media3.extractor.ExtractorOutput
++import androidx.media3.extractor.ExtractorsFactory
++import androidx.media3.extractor.PositionHolder
++import androidx.media3.extractor.SeekMap
++import androidx.media3.extractor.SeekPoint
++import androidx.media3.extractor.SniffFailure
++import androidx.media3.extractor.TrackOutput
++import androidx.media3.extractor.mkv.MatroskaExtractor
++import androidx.media3.extractor.text.SubtitleParser
++import java.util.TreeMap
++import kotlin.math.abs
++
++/**
++ * Muitos MKV de servidores IPTV são gravados em modo streaming: sem índice (Cues) e às vezes sem duração.
++ * O MatroskaExtractor os trata como não buscáveis e o seekTo é ignorado. Como o VLC, este extrator estima a
++ * posição em bytes pelo tempo, procura o próximo Cluster e refina a estimativa com os tempos encontrados.
++ */
++@OptIn(UnstableApi::class)
++class IndexlessSeekExtractorsFactory : ExtractorsFactory {
++  private val delegate = DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true)
++
++  override fun createExtractors(): Array<Extractor> = delegate.createExtractors().map(::wrap).toTypedArray()
++
++  override fun createExtractors(uri: Uri, responseHeaders: Map<String, List<String>>): Array<Extractor> =
++    delegate.createExtractors(uri, responseHeaders).map(::wrap).toTypedArray()
++
++  override fun experimentalSetTextTrackTranscodingEnabled(textTrackTranscodingEnabled: Boolean): ExtractorsFactory {
++    delegate.experimentalSetTextTrackTranscodingEnabled(textTrackTranscodingEnabled)
++    return this
++  }
++
++  override fun setSubtitleParserFactory(subtitleParserFactory: SubtitleParser.Factory): ExtractorsFactory {
++    delegate.setSubtitleParserFactory(subtitleParserFactory)
++    return this
++  }
++
++  override fun experimentalSetCodecsToParseWithinGopSampleDependencies(codecsToParseWithinGopSampleDependencies: Int): ExtractorsFactory {
++    delegate.experimentalSetCodecsToParseWithinGopSampleDependencies(codecsToParseWithinGopSampleDependencies)
++    return this
++  }
++
++  private fun wrap(extractor: Extractor): Extractor =
++    if (extractor.underlyingImplementation is MatroskaExtractor) IndexlessMatroskaExtractor(extractor) else extractor
++}
++
++@OptIn(UnstableApi::class)
++private class IndexlessMatroskaExtractor(private val delegate: Extractor) : Extractor {
++  private var state = STATE_PASSTHROUGH
++  private var output: ExtractorOutput = ExtractorOutput.PLACEHOLDER
++  private var withheldMap: SeekMap? = null
++  private var seekMap: ApproximateSeekMap? = null
++
++  private var headInspected = false
++  private var timecodeScaleNs = DEFAULT_TIMECODE_SCALE_NS
++  private var firstClusterPosition = C.INDEX_UNSET.toLong()
++  private var firstClusterTimeUs = 0L
++
++  private var resumePosition = 0L
++  private var probePosition = 0L
++  private var resyncTargetUs = C.TIME_UNSET
++  private var resyncAttempts = 0
++
++  override fun sniff(input: ExtractorInput): Boolean = delegate.sniff(input)
++
++  override fun getSniffFailureDetails(): List<SniffFailure> = delegate.sniffFailureDetails
++
++  override fun getUnderlyingImplementation(): Extractor = delegate.underlyingImplementation
++
++  override fun init(output: ExtractorOutput) {
++    this.output = output
++    delegate.init(object : ExtractorOutput {
++      override fun track(id: Int, type: Int): TrackOutput = output.track(id, type)
++
++      override fun endTracks() = output.endTracks()
++
++      override fun seekMap(seekMap: SeekMap) {
++        if (seekMap.isSeekable || state != STATE_PASSTHROUGH) {
++          output.seekMap(seekMap)
++          return
++        }
++        // Segura o mapa "não buscável" até montar o aproximado; o player só fica pronto depois disso.
++        withheldMap = seekMap
++        state = STATE_NEEDS_INDEX
++      }
++    })
++  }
++
++  override fun read(input: ExtractorInput, seekPosition: PositionHolder): Int {
++    if (!headInspected) {
++      headInspected = true
++      if (input.position == 0L) inspectHead(input)
++    }
++    when (state) {
++      STATE_NEEDS_INDEX -> return startIndexing(input, seekPosition)
++      STATE_PROBING_END -> return finishProbe(input, seekPosition)
++      STATE_RESYNC -> resync(input, seekPosition)?.let { return it }
++    }
++    return delegate.read(input, seekPosition)
++  }
++
++  override fun seek(position: Long, timeUs: Long) {
++    delegate.seek(position, timeUs)
++    when (state) {
++      STATE_PROBING_END -> state = STATE_NEEDS_INDEX
++      STATE_ACTIVE, STATE_RESYNC -> {
++        state = if (position > 0) STATE_RESYNC else STATE_ACTIVE
++        resyncTargetUs = timeUs
++        resyncAttempts = 0
++      }
++    }
++  }
++
++  override fun release() = delegate.release()
++
++  private fun startIndexing(input: ExtractorInput, seekPosition: PositionHolder): Int {
++    val withheld = withheldMap ?: return giveUp(input, seekPosition)
++    val length = input.length
++    if (length == C.LENGTH_UNSET.toLong() || length <= input.position) return giveUp(input, seekPosition)
++    resumePosition = input.position
++    if (firstClusterPosition == C.INDEX_UNSET.toLong()) firstClusterPosition = resumePosition
++    if (withheld.durationUs != C.TIME_UNSET) {
++      publish(withheld.durationUs, lastPosition = length, lastTimeUs = withheld.durationUs)
++      return delegate.read(input, seekPosition)
++    }
++    // Sem duração no arquivo: lê o fim para achar o tempo do último Cluster.
++    probePosition = maxOf(resumePosition, length - PROBE_BYTES)
++    state = STATE_PROBING_END
++    seekPosition.position = probePosition
++    return Extractor.RESULT_SEEK
++  }
++
++  private fun finishProbe(input: ExtractorInput, seekPosition: PositionHolder): Int {
++    if (input.position != probePosition) return startIndexing(input, seekPosition)
++    val size = (input.length - input.position).coerceIn(0, PROBE_BYTES).toInt()
++    val buffer = ByteArray(size)
++    val read = readUpTo(input, buffer)
++    val last = findLastCluster(buffer, read)
++    if (last == null) {
++      output.seekMap(withheldMap ?: SeekMap.Unseekable(C.TIME_UNSET))
++      state = STATE_DISABLED
++    } else {
++      publish(
++        durationUs = toUs(last.timecode + last.lastBlockOffset) + LAST_FRAME_US,
++        lastPosition = probePosition + last.offset,
++        lastTimeUs = toUs(last.timecode)
++      )
++    }
++    seekPosition.position = resumePosition
++    return Extractor.RESULT_SEEK
++  }
++
++  private fun giveUp(input: ExtractorInput, seekPosition: PositionHolder): Int {
++    output.seekMap(withheldMap ?: SeekMap.Unseekable(C.TIME_UNSET))
++    state = STATE_DISABLED
++    return delegate.read(input, seekPosition)
++  }
++
++  private fun publish(durationUs: Long, lastPosition: Long, lastTimeUs: Long) {
++    val map = ApproximateSeekMap(durationUs, firstClusterPosition)
++    map.addAnchor(firstClusterTimeUs, firstClusterPosition)
++    map.addAnchor(lastTimeUs, lastPosition)
++    seekMap = map
++    state = STATE_ACTIVE
++    output.seekMap(map)
++  }
++
++  /** Avança até o próximo Cluster; se o tempo dele estiver longe do alvo, pede outro salto mais preciso. */
++  private fun resync(input: ExtractorInput, seekPosition: PositionHolder): Int? {
++    val map = seekMap
++    val foundUs = if (map == null) null else skipToNextCluster(input, map.durationUs + MAX_LATE_US)
++    if (map == null || foundUs == null) {
++      state = STATE_ACTIVE
++      return null
++    }
++    map.addAnchor(foundUs, input.position)
++    val target = resyncTargetUs
++    val tooEarly = foundUs < target - MAX_EARLY_US
++    val tooLate = foundUs > target + MAX_LATE_US
++    if ((tooEarly || tooLate) && resyncAttempts < MAX_RESYNC_ATTEMPTS) {
++      val next = map.positionFor(target)
++      if (abs(next - input.position) >= MIN_JUMP_BYTES) {
++        resyncAttempts += 1
++        seekPosition.position = next
++        return Extractor.RESULT_SEEK
++      }
++    }
++    state = STATE_ACTIVE
++    return null
++  }
++
++  private fun skipToNextCluster(input: ExtractorInput, maxTimeUs: Long): Long? {
++    val window = ByteArray(SCAN_CHUNK)
++    var scanned = 0L
++    while (scanned < SCAN_LIMIT) {
++      input.resetPeekPosition()
++      val available = peekUpTo(input, window)
++      for (i in 0 until available - 4) {
++        if (!isClusterId(window, i)) continue
++        val timecode = parseClusterTimecode(window, i, available)?.first ?: continue
++        val timeUs = toUs(timecode)
++        if (timeUs > maxTimeUs) continue
++        input.resetPeekPosition()
++        input.skipFully(i)
++        return timeUs
++      }
++      input.resetPeekPosition()
++      if (available < window.size) return null
++      val advance = available - SCAN_OVERLAP
++      if (!input.skipFully(advance, true)) return null
++      scanned += advance
++    }
++    return null
++  }
++
++  private fun inspectHead(input: ExtractorInput) {
++    val head = ByteArray(HEAD_BYTES)
++    val available = peekUpTo(input, head)
++    input.resetPeekPosition()
++    for (i in 0 until available - 4) {
++      if (head[i] == 0x2A.toByte() && head[i + 1] == 0xD7.toByte() && head[i + 2] == 0xB1.toByte()) {
++        val value = readUnsigned(head, i + 3, available)
++        if (value != null && value > 0) timecodeScaleNs = value
++        break
++      }
++    }
++    for (i in 0 until available - 4) {
++      if (!isClusterId(head, i)) continue
++      val timecode = parseClusterTimecode(head, i, available)?.first ?: continue
++      firstClusterPosition = i.toLong()
++      firstClusterTimeUs = toUs(timecode)
++      break
++    }
++  }
++
++  private fun findLastCluster(buffer: ByteArray, end: Int): LastCluster? {
++    var best: LastCluster? = null
++    for (i in 0 until end - 4) {
++      if (!isClusterId(buffer, i)) continue
++      val (timecode, childrenStart) = parseClusterTimecode(buffer, i, end) ?: continue
++      val previous = best
++      // Descarta falsos positivos dentro dos dados de vídeo: o tempo dos Clusters só cresce, em passos curtos.
++      if (previous != null && (timecode < previous.timecode || toUs(timecode - previous.timecode) > MAX_CLUSTER_GAP_US)) continue
++      best = LastCluster(i.toLong(), timecode, childrenStart, 0)
++    }
++    val found = best ?: return null
++    return found.copy(lastBlockOffset = lastBlockOffset(buffer, found.childrenStart, end))
++  }
++
++  /** Maior tempo relativo de bloco dentro do Cluster (SimpleBlock ou Block dentro de BlockGroup). */
++  private fun lastBlockOffset(buffer: ByteArray, start: Int, end: Int): Long {
++    var max = 0L
++    var p = start
++    while (p < end) {
++      val id = readVint(buffer, p, end, keepMarker = true) ?: break
++      val size = readVint(buffer, p + id.length, end, keepMarker = false) ?: break
++      val data = p + id.length + size.length
++      when (id.value) {
++        ID_SIMPLE_BLOCK.toLong() -> blockTimecode(buffer, data, end)?.let { max = maxOf(max, it) }
++        ID_BLOCK_GROUP.toLong() -> {
++          if (data + 1 < end && buffer[data] == ID_BLOCK.toByte()) {
++            val blockSize = readVint(buffer, data + 1, end, keepMarker = false)
++            if (blockSize != null) blockTimecode(buffer, data + 1 + blockSize.length, end)?.let { max = maxOf(max, it) }
++          }
++        }
++        ID_CLUSTER -> break
++      }
++      if (size.unknown || size.value > end - data) break
++      p = data + size.value.toInt()
++    }
++    return max
++  }
++
++  private fun blockTimecode(buffer: ByteArray, start: Int, end: Int): Long? {
++    val track = readVint(buffer, start, end, keepMarker = false) ?: return null
++    val p = start + track.length
++    if (p + 2 > end) return null
++    return ((buffer[p].toInt() shl 8) or (buffer[p + 1].toInt() and 0xFF)).toShort().toLong().coerceAtLeast(0)
++  }
++
++  private fun toUs(timecode: Long): Long = timecode * timecodeScaleNs / 1000
++
++  private data class LastCluster(val offset: Long, val timecode: Long, val childrenStart: Int, val lastBlockOffset: Long)
++
++  private companion object {
++    const val STATE_PASSTHROUGH = 0
++    const val STATE_NEEDS_INDEX = 1
++    const val STATE_PROBING_END = 2
++    const val STATE_ACTIVE = 3
++    const val STATE_RESYNC = 4
++    const val STATE_DISABLED = 5
++
++    const val ID_CLUSTER = 0x1F43B675L
++    const val ID_TIMECODE = 0xE7
++    const val ID_CRC32 = 0xBF
++    const val ID_SIMPLE_BLOCK = 0xA3
++    const val ID_BLOCK_GROUP = 0xA0
++    const val ID_BLOCK = 0xA1
++
++    const val DEFAULT_TIMECODE_SCALE_NS = 1_000_000L
++    const val HEAD_BYTES = 256 * 1024
++    const val PROBE_BYTES = 4L * 1024 * 1024
++    const val SCAN_CHUNK = 64 * 1024
++    const val SCAN_OVERLAP = 64
++    const val SCAN_LIMIT = 32L * 1024 * 1024
++    const val MIN_JUMP_BYTES = 256L * 1024
++    const val MAX_RESYNC_ATTEMPTS = 6
++    const val MAX_EARLY_US = 30_000_000L
++    const val MAX_LATE_US = 6_000_000L
++    const val MAX_CLUSTER_GAP_US = 120_000_000L
++    const val LAST_FRAME_US = 40_000L
++
++    fun isClusterId(b: ByteArray, i: Int): Boolean =
++      b[i] == 0x1F.toByte() && b[i + 1] == 0x43.toByte() && b[i + 2] == 0xB6.toByte() && b[i + 3] == 0x75.toByte()
++
++    /** Valida o cabeçalho do Cluster e devolve o Timecode e a posição do primeiro filho depois dele. */
++    fun parseClusterTimecode(b: ByteArray, i: Int, end: Int): Pair<Long, Int>? {
++      var p = i + 4
++      val size = readVint(b, p, end, keepMarker = false) ?: return null
++      p += size.length
++      if (p + 2 <= end && b[p] == ID_CRC32.toByte() && b[p + 1] == 0x84.toByte()) p += 6
++      if (p + 2 > end || b[p] != ID_TIMECODE.toByte()) return null
++      val length = (b[p + 1].toInt() and 0xFF) - 0x80
++      if (length !in 1..8 || p + 2 + length > end) return null
++      val value = readUnsigned(b, p + 1, end) ?: return null
++      return value to (p + 2 + length)
++    }
++
++    /** Lê um inteiro sem sinal precedido do tamanho EBML de 1 byte (0x81 a 0x88). */
++    fun readUnsigned(b: ByteArray, sizeIndex: Int, end: Int): Long? {
++      if (sizeIndex >= end) return null
++      val length = (b[sizeIndex].toInt() and 0xFF) - 0x80
++      if (length !in 1..8 || sizeIndex + 1 + length > end) return null
++      var value = 0L
++      for (k in 1..length) value = (value shl 8) or (b[sizeIndex + k].toLong() and 0xFF)
++      return value
++    }
++
++    fun readVint(b: ByteArray, i: Int, end: Int, keepMarker: Boolean): Vint? {
++      if (i >= end) return null
++      val first = b[i].toInt() and 0xFF
++      if (first == 0) return null
++      val length = Integer.numberOfLeadingZeros(first) - 23
++      if (i + length > end) return null
++      var value = (if (keepMarker) first else first and (0xFF shr length)).toLong()
++      for (k in 1 until length) value = (value shl 8) or (b[i + k].toLong() and 0xFF)
++      val unknown = !keepMarker && value == (1L shl (7 * length)) - 1
++      return Vint(value, length, unknown)
++    }
++
++    fun peekUpTo(input: ExtractorInput, target: ByteArray): Int {
++      var total = 0
++      while (total < target.size) {
++        val n = input.peek(target, total, target.size - total)
++        if (n == C.RESULT_END_OF_INPUT) break
++        total += n
++      }
++      return total
++    }
++
++    fun readUpTo(input: ExtractorInput, target: ByteArray): Int {
++      var total = 0
++      while (total < target.size) {
++        val n = input.read(target, total, target.size - total)
++        if (n == C.RESULT_END_OF_INPUT) break
++        total += n
++      }
++      return total
++    }
++  }
++
++  private data class Vint(val value: Long, val length: Int, val unknown: Boolean)
++}
++
++/** Mapa de busca por interpolação entre pontos conhecidos (tempo do Cluster e sua posição em bytes). */
++@OptIn(UnstableApi::class)
++private class ApproximateSeekMap(val durationUs: Long, private val dataStart: Long) : SeekMap {
++  private val anchors = TreeMap<Long, Long>()
++
++  @Synchronized
++  fun addAnchor(timeUs: Long, position: Long) {
++    val lower = anchors.floorEntry(timeUs)
++    val higher = anchors.ceilingEntry(timeUs)
++    if (lower != null && lower.key != timeUs && lower.value > position) return
++    if (higher != null && higher.key != timeUs && higher.value < position) return
++    anchors[timeUs] = position
++  }
++
++  override fun isSeekable(): Boolean = true
++
++  override fun getDurationUs(): Long = durationUs
++
++  override fun getSeekPoints(timeUs: Long): SeekMap.SeekPoints {
++    val clamped = timeUs.coerceIn(0, durationUs)
++    return SeekMap.SeekPoints(SeekPoint(clamped, positionFor(clamped)))
++  }
++
++  /** Mira alguns segundos antes do alvo: chegar antes só custa decodificar um pouco; chegar depois pula cena. */
++  @Synchronized
++  fun positionFor(timeUs: Long): Long {
++    val aim = (timeUs - AIM_EARLY_US).coerceAtLeast(0)
++    val lower = anchors.floorEntry(aim) ?: return dataStart
++    val higher = anchors.ceilingEntry(aim) ?: return lower.value
++    if (higher.key == lower.key) return lower.value
++    val ratio = (aim - lower.key).toDouble() / (higher.key - lower.key)
++    return lower.value + ((higher.value - lower.value) * ratio).toLong()
++  }
++
++  private companion object {
++    const val AIM_EARLY_US = 8_000_000L
++  }
++}
+diff --git a/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/ResumingInterceptor.kt b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/ResumingInterceptor.kt
+new file mode 100644
+index 0000000..78948a7
+--- /dev/null
++++ b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/ResumingInterceptor.kt
+@@ -0,0 +1,125 @@
++package expo.modules.video
++
++import okhttp3.HttpUrl
++import okhttp3.Interceptor
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import okhttp3.ResponseBody.Companion.asResponseBody
++import okio.Buffer
++import okio.BufferedSource
++import okio.Source
++import okio.Timeout
++import okio.buffer
++import java.io.IOException
++import java.net.ProtocolException
++
++/**
++ * Alguns servidores IPTV encerram a conexão antes de enviar todo o Content-Length (ex.: a cada 512 KB).
++ * Players como VLC reconectam com Range a partir do último byte recebido; o ExoPlayer trata isso como erro.
++ * Este interceptor faz a reconexão de forma transparente para o OkHttpDataSource.
++ */
++class ResumingInterceptor(private val client: OkHttpClient) : Interceptor {
++  override fun intercept(chain: Interceptor.Chain): Response {
++    val request = chain.request()
++    val response = chain.proceed(request)
++    if (request.method != "GET" || (response.code != 200 && response.code != 206)) return response
++    val body = response.body ?: return response
++    val length = body.contentLength()
++    if (length <= 0) return response
++
++    val start = if (response.code == 206) parseContentRangeStart(response.header("Content-Range")) else 0L
++    if (start == null) return response
++
++    val source = ResumingSource(
++      client = client,
++      request = request,
++      resumeUrl = response.request.url,
++      initial = body.source(),
++      start = start,
++      length = length
++    )
++    return response.newBuilder().body(source.buffer().asResponseBody(body.contentType(), length)).build()
++  }
++
++  private fun parseContentRangeStart(header: String?): Long? {
++    val match = Regex("""bytes\s+(\d+)-\d+/""").find(header ?: return null) ?: return null
++    return match.groupValues[1].toLongOrNull()
++  }
++}
++
++private class ResumingSource(
++  private val client: OkHttpClient,
++  private val request: Request,
++  private val resumeUrl: HttpUrl,
++  initial: BufferedSource,
++  private val start: Long,
++  private val length: Long
++) : Source {
++  private var current: BufferedSource = initial
++  private var received = 0L
++  private var failures = 0
++
++  @Volatile
++  private var closed = false
++
++  override fun read(sink: Buffer, byteCount: Long): Long {
++    if (received >= length) return -1
++    while (true) {
++      val count = try {
++        current.read(sink, minOf(byteCount, length - received))
++      } catch (e: IOException) {
++        if (closed || failures >= MAX_CONSECUTIVE_FAILURES) throw e
++        CUT
++      }
++      if (count > 0) {
++        received += count
++        failures = 0
++        return count
++      }
++      if (received >= length) return -1
++      if (closed || failures >= MAX_CONSECUTIVE_FAILURES) throw ProtocolException("unexpected end of stream")
++      reopen()
++    }
++  }
++
++  private fun reopen() {
++    failures += 1
++    runCatching { current.close() }
++    val from = start + received
++    val end = start + length - 1
++    // Primeiro a URL final (após redirecionamentos, com token); se expirar, a URL original refaz a cadeia.
++    val urls = if (resumeUrl == request.url) listOf(resumeUrl) else listOf(resumeUrl, request.url)
++    var lastError: IOException? = null
++    for (url in urls) {
++      val next = request.newBuilder().url(url).header("Range", "bytes=$from-$end").build()
++      val response = try {
++        client.newCall(next).execute()
++      } catch (e: IOException) {
++        lastError = e
++        continue
++      }
++      val body = response.body
++      val contentRange = response.header("Content-Range") ?: ""
++      if (response.code == 206 && body != null && contentRange.startsWith("bytes $from-")) {
++        current = body.source()
++        return
++      }
++      response.close()
++      lastError = IOException("Resume failed: HTTP ${response.code} $contentRange")
++    }
++    throw lastError ?: IOException("Resume failed")
++  }
++
++  override fun timeout(): Timeout = current.timeout()
++
++  override fun close() {
++    closed = true
++    current.close()
++  }
++
++  private companion object {
++    const val MAX_CONSECUTIVE_FAILURES = 5
++    const val CUT = 0L
++  }
++}
